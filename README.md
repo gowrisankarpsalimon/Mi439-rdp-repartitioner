@@ -1,0 +1,41 @@
+# Mi439-rdp-repartitioner
+
+Recovery-flashable zip that repartitions Mi439 (kernel 4.19) devices for
+**Retrofit Dynamic Partitions (RDP)**.
+
+Supported devices: Redmi 8 / 8A / 8A Dual / 7A (`olive`, `olivelite`, `olivewood`, `pine`).
+
+## Resulting layout
+
+`system | vendor | product (takes over old "cust" slot) | userdata (rest of disk)`
+
+The ROM then builds its virtual `super` on top of system + vendor + product.
+
+## Sizes
+
+Sizes (MB) are read from the **zip filename**: `Mi439_rdp_S<system>_V<vendor>_P<product>.zip`
+
+Default: `Mi439_rdp_S5120_V1024_P1024.zip`
+
+Build a custom one:
+
+```sh
+./build.sh 5120 1024 1024
+```
+
+Limits: system 2048-16384, vendor 512-4096, product 256-4096 MB. Userdata must keep at least 4096 MB.
+
+## Usage
+
+1. Boot into a custom recovery that has `sgdisk`.
+2. Flash the zip.
+3. Format Data, reboot to recovery.
+4. Flash your RDP-enabled ROM (sizes must match its BoardConfig).
+
+A GPT backup is saved next to the zip. Restore with:
+`sgdisk --load-backup=mi439_gpt_backup.bin /dev/block/mmcblk0`
+
+## Warning
+
+This rewrites the partition table and wipes system, vendor, cust and userdata.
+Back up everything first. Use at your own risk.

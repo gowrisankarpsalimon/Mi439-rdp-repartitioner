@@ -1,0 +1,169 @@
+#!/sbin/sh
+# Mi439 (kernel 4.19) - Retrofit Dynamic Partitions (RDP) repartition script
+#
+# Result layout (all contiguous, original partition numbers reused):
+#   system | vendor | product (takes over old "cust" slot) | userdata (rest of disk)
+# The ROM then builds its virtual "super" on top of system+vendor+product.
+#
+# Sizes (MB) can be set via the zip filename:  Mi439_rdp_S5120_V1024_P1024.zip
+# Nothing is hardcoded about the stock layout: start sectors and type GUIDs are
+# read from the device itself, and the whole GPT change is applied atomically.
+
+OUTFD=$2
+ZIP=$3
+DEVICE="/dev/block/mmcblk0"
+
+# ---- defaults (MB) ----
+SYS_MB=5120
+VEN_MB=1024
+PROD_MB=1024
+MIN_DATA_MB=4096
+ALLOWED_DEVICES="olive olivelite olivewood pine"   # Redmi 8 / 8A / 8A Dual / 7A
+
+PT_WRITTEN=0
+
+ui_print() {
+  echo "ui_print $1" > /proc/self/fd/$OUTFD
+  echo "ui_print" > /proc/self/fd/$OUTFD
+}
+
+abort() {
+  ui_print ""
+  ui_print "ERROR: $1"
+  if [ "$PT_WRITTEN" = "0" ]; then
+    ui_print "Partition table was NOT modified."
+  else
+    ui_print "Partition table WAS modified. Restore with the GPT backup:"
+    ui_print "  sgdisk --load-backup=<backup.bin> $DEVICE"
+  fi
+  exit 1
+}
+
+# ---------- parse sizes from filename ----------
+FILENAME=$(basename "$ZIP")
+v=$(echo "$FILENAME" | sed -n 's/.*_S\([0-9][0-9]*\)_V.*/\1/p'); [ -n "$v" ] && SYS_MB=$v
+v=$(echo "$FILENAME" | sed -n 's/.*_V\([0-9][0-9]*\)_P.*/\1/p'); [ -n "$v" ] && VEN_MB=$v
+v=$(echo "$FILENAME" | sed -n 's/.*_P\([0-9][0-9]*\)[._].*/\1/p'); [ -n "$v" ] && PROD_MB=$v
+
+ui_print "Mi439 RDP Repartitioner (K4.19)"
+ui_print "- system : ${SYS_MB} MB"
+ui_print "- vendor : ${VEN_MB} MB"
+ui_print "- product: ${PROD_MB} MB"
+ui_print "- userdata: remainder (min ${MIN_DATA_MB} MB)"
+ui_print ""
+
+[ "$SYS_MB"  -ge 2048 ] && [ "$SYS_MB"  -le 16384 ] || abort "system size must be 2048-16384 MB"
+[ "$VEN_MB"  -ge 512  ] && [ "$VEN_MB"  -le 4096  ] || abort "vendor size must be 512-4096 MB"
+[ "$PROD_MB" -ge 256  ] && [ "$PROD_MB" -le 4096  ] || abort "product size must be 256-4096 MB"
+
+# ---------- sanity checks ----------
+DEV_NAME=$(getprop ro.product.device)
+[ -z "$DEV_NAME" ] && DEV_NAME=$(getprop ro.build.product)
+OK=0
+for d in $ALLOWED_DEVICES; do [ "$DEV_NAME" = "$d" ] && OK=1; done
+[ "$OK" = "1" ] || abort "unsupported device '$DEV_NAME' (allowed: $ALLOWED_DEVICES)"
+
+for t in sgdisk awk sed dd blockdev grep; do
+  command -v $t >/dev/null 2>&1 || abort "required tool missing in recovery: $t"
+done
+[ -b "$DEVICE" ] || abort "$DEVICE not found"
+
+# ---------- read current layout ----------
+part_num() {
+  sgdisk -p "$DEVICE" | awk -v n="$1" '$1 ~ /^[0-9]+$/ && $NF==n {print $1; exit}'
+}
+part_field() {  # $1=num $2=first|last|guid
+  case "$2" in
+    first) sgdisk -i "$1" "$DEVICE" | awk '/^First sector:/ {print $3}' ;;
+    last)  sgdisk -i "$1" "$DEVICE" | awk '/^Last sector:/ {print $3}' ;;
+    guid)  sgdisk -i "$1" "$DEVICE" | awk '/^Partition GUID code:/ {print $4}' ;;
+  esac
+}
+
+NS=$(part_num system);   [ -n "$NS" ] || abort "partition 'system' not found"
+NV=$(part_num vendor);   [ -n "$NV" ] || abort "partition 'vendor' not found"
+NC=$(part_num cust);     [ -n "$NC" ] || abort "partition 'cust' not found (already repartitioned?)"
+NU=$(part_num userdata); [ -n "$NU" ] || abort "partition 'userdata' not found"
+[ -z "$(part_num product)" ] || abort "a 'product' partition already exists"
+
+SYS_START=$(part_field $NS first);  SYS_END_OLD=$(part_field $NS last)
+VEN_START_OLD=$(part_field $NV first); VEN_END_OLD=$(part_field $NV last)
+CUST_START_OLD=$(part_field $NC first); CUST_END_OLD=$(part_field $NC last)
+UD_START_OLD=$(part_field $NU first);  UD_END=$(part_field $NU last)
+T_SYS=$(part_field $NS guid); T_VEN=$(part_field $NV guid); T_UD=$(part_field $NU guid)
+
+for x in $SYS_START $SYS_END_OLD $VEN_START_OLD $VEN_END_OLD $CUST_START_OLD $CUST_END_OLD $UD_START_OLD $UD_END $T_SYS $T_VEN $T_UD; do
+  [ -n "$x" ] || abort "could not read partition details from sgdisk"
+done
+
+# system, vendor, cust, userdata must be one contiguous block
+[ $((SYS_END_OLD + 1)) -eq "$VEN_START_OLD" ]  || abort "system/vendor are not contiguous"
+[ $((VEN_END_OLD + 1)) -eq "$CUST_START_OLD" ] || abort "vendor/cust are not contiguous"
+[ $((CUST_END_OLD + 1)) -eq "$UD_START_OLD" ]  || abort "cust/userdata are not contiguous"
+
+# ---------- compute new layout (1 MB = 2048 sectors, stays aligned) ----------
+SYS_END=$((SYS_START + SYS_MB*2048 - 1))
+VEN_START=$((SYS_END + 1));  VEN_END=$((VEN_START + VEN_MB*2048 - 1))
+PROD_START=$((VEN_END + 1)); PROD_END=$((PROD_START + PROD_MB*2048 - 1))
+DATA_START=$((PROD_END + 1))
+DATA_SECT=$((UD_END - DATA_START + 1))
+[ "$DATA_SECT" -ge $((MIN_DATA_MB*2048)) ] || abort "not enough space: userdata would be only $((DATA_SECT/2048)) MB"
+
+ui_print "userdata will be $((DATA_SECT/2048)) MB"
+
+# ---------- unmount ----------
+for M in $(awk -v d="$DEVICE" 'index($1,d)==1 {print $2}' /proc/mounts); do
+  umount "$M" 2>/dev/null
+done
+if grep -Eq "^${DEVICE}p(${NS}|${NV}|${NC}|${NU}) " /proc/mounts; then
+  abort "target partitions are still mounted"
+fi
+
+# ---------- backup ----------
+ui_print "[1/4] Backing up GPT..."
+BK=/tmp/mi439_gpt_backup.bin
+sgdisk --backup="$BK" "$DEVICE" || abort "GPT backup failed"
+sgdisk -p "$DEVICE" > /tmp/mi439_gpt_before.txt 2>&1
+ZIPDIR=$(dirname "$ZIP")
+if cp "$BK" /tmp/mi439_gpt_before.txt "$ZIPDIR"/ 2>/dev/null; then
+  ui_print "  saved next to zip: $ZIPDIR/mi439_gpt_backup.bin"
+else
+  ui_print "  WARNING: could not copy backup off /tmp - 'adb pull $BK' NOW"
+fi
+
+# ---------- write new table (single atomic sgdisk call) ----------
+ui_print "[2/4] Writing new partition table..."
+sgdisk \
+  --delete=$NS --delete=$NV --delete=$NC --delete=$NU \
+  --new=$NS:$SYS_START:$SYS_END    --change-name=$NS:system   --typecode=$NS:$T_SYS \
+  --new=$NV:$VEN_START:$VEN_END    --change-name=$NV:vendor   --typecode=$NV:$T_VEN \
+  --new=$NC:$PROD_START:$PROD_END  --change-name=$NC:product  --typecode=$NC:$T_SYS \
+  --new=$NU:$DATA_START:$UD_END    --change-name=$NU:userdata --typecode=$NU:$T_UD \
+  "$DEVICE" || abort "sgdisk failed"
+PT_WRITTEN=1
+
+# ---------- make kernel re-read the table ----------
+ui_print "[3/4] Refreshing kernel partition table..."
+sync
+blockdev --rereadpt "$DEVICE" 2>/dev/null
+sleep 3
+
+chk() { [ "$(blockdev --getsz ${DEVICE}p$1 2>/dev/null)" = "$2" ]; }
+if chk $NS $((SYS_MB*2048)) && chk $NV $((VEN_MB*2048)) && chk $NC $((PROD_MB*2048)) && chk $NU $DATA_SECT; then
+  ui_print "[4/4] Wiping old filesystem signatures..."
+  for N in $NS $NV $NC $NU; do
+    dd if=/dev/zero of=${DEVICE}p$N bs=1M count=16 2>/dev/null
+  done
+  sync
+  ui_print ""
+  sgdisk -p "$DEVICE" | tail -5 | while read LINE; do ui_print "$LINE"; done
+  ui_print ""
+  ui_print "Done. Next: Format Data in recovery, reboot recovery,"
+  ui_print "then flash your RDP-enabled ROM (sizes must match its BoardConfig)."
+else
+  ui_print ""
+  ui_print "Table written, but the kernel could not re-read it (busy)."
+  ui_print "Reboot to recovery now, then Format Data and flash the ROM."
+  ui_print "(Old signatures were not wiped; Format Data / ROM install handles it.)"
+fi
+exit 0
